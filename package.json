@@ -1,0 +1,13 @@
+{
+  "name": "vidgen",
+  "version": "1.0.0",
+  "private": true,
+  "description": "VidGen — Omni Flash + Seedance 2 Pro video generation site",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

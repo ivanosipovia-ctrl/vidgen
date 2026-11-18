@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: vidgen
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/config
+    envVars:
+      - key: TARGET_URL
+        value: http://160.30.161.35
