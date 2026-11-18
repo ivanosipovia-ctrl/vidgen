@@ -1,5 +1,5 @@
 // video-site backend — no dependencies, Node 18+
-// flow per generation: emailnator address -> fresh account on target -> batch -> poll -> download mp4
+// flow per generation: authorize -> batch -> poll -> download mp4
 'use strict';
 
 const http = require('http');
@@ -31,6 +31,49 @@ function paidToken() {
 for (const dir of [DATA_DIR, VIDEO_DIR]) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
+
+// ---------------------------------------------------------------- api keys
+// data/keys.json: { "<key>": { id, name, createdAt, lastUsedAt, disabled } }
+// the built-in "web" key is auto-provisioned and returned by /api/config so the
+// site UI can authenticate; external apps get their own keys via POST /api/keys
+const KEYS_FILE = path.join(DATA_DIR, 'keys.json');
+const WEB_KEY_ID = 'web';
+
+let keys = {};
+if (fs.existsSync(KEYS_FILE)) {
+  try { keys = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8')); } catch (e) { keys = {}; }
+}
+function saveKeys() {
+  try { fs.writeFileSync(KEYS_FILE, JSON.stringify(keys, null, 2)); } catch (e) {}
+}
+function findWebKey() {
+  for (const [k, v] of Object.entries(keys)) if (v && v.id === WEB_KEY_ID && !v.disabled) return k;
+  return null;
+}
+if (!findWebKey()) {
+  const k = 'vg_' + rnd(24);
+  keys[k] = { id: WEB_KEY_ID, name: 'web', createdAt: Date.now(), lastUsedAt: null };
+  saveKeys();
+}
+const WEB_KEY = findWebKey();
+
+function keyFrom(req, url) {
+  const h = req.headers['x-api-key'] || req.headers['authorization'] || '';
+  const m = /^Bearer\s+(.+)$/i.exec(String(h));
+  if (m) return m[1].trim();
+  if (req.headers['x-api-key']) return String(req.headers['x-api-key']).trim();
+  const q = url.searchParams.get('key'); // videos: <video src> cannot send headers
+  return q ? q.trim() : '';
+}
+function authKey(req, url) {
+  const k = keyFrom(req, url);
+  if (!k) return null;
+  const rec = keys[k];
+  if (!rec || rec.disabled) return null;
+  rec.lastUsedAt = Date.now();
+  return { key: k, ...rec };
+}
+function isWeb(rec) { return rec && rec.id === WEB_KEY_ID; }
 
 // ---------------------------------------------------------------- job store
 let jobs = {};
@@ -77,7 +120,7 @@ function publicJob(j) {
     progress: j.progress,
     createdAt: j.createdAt,
     finishedAt: j.finishedAt || null,
-    account: j.account || null,
+    keyLabel: j.keyLabel || null,
     hasVideo: Boolean(j.videoFile && fs.existsSync(path.join(VIDEO_DIR, j.videoFile))),
   };
 }
@@ -373,7 +416,7 @@ async function runJob(job) {
   } catch (e) {
     let msg = String(e && e.message || e);
     if (/Gói|gói cước|nạp|kích hoạt|số dư|Số dư/i.test(msg)) {
-      msg += ' — источник требует активный пакет на аккаунте для Seedance. Omni Flash (Veo) бесплатный.';
+      msg += ' — для Seedance нужен активный тариф на стороне API. Omni Flash (Veo) работает бесплатно.';
     }
     job.status = 'error';
     job.error = msg;
@@ -464,8 +507,57 @@ const server = http.createServer(async (req, res) => {
   const p = url.pathname;
 
   try {
+    if (p === '/api/config' && req.method === 'GET') {
+      // web-ключ отдаём только браузеру с нашего же хоста — внешние приложения
+      // берут собственные ключи через POST /api/keys
+      const host = req.headers.host || '';
+      const src = String(req.headers.origin || req.headers.referer || '');
+      const sameOrigin = src.includes(host);
+      return json(res, 200, Object.assign({ target: TARGET }, sameOrigin ? { webKey: WEB_KEY } : {}));
+    }
+
+    if (p === '/api/keys' && req.method === 'GET') {
+      const who = authKey(req, url);
+      if (!isWeb(who)) return json(res, 403, { error: 'нужен web-ключ' });
+      const list = Object.entries(keys)
+        .filter(([, v]) => v && !v.disabled)
+        .map(([k, v]) => ({ key: k, id: v.id, name: v.name, createdAt: v.createdAt, lastUsedAt: v.lastUsedAt || null }));
+      return json(res, 200, { keys: list });
+    }
+
+    if (p === '/api/keys' && req.method === 'POST') {
+      const who = authKey(req, url);
+      if (!isWeb(who)) return json(res, 403, { error: 'нужен web-ключ' });
+      const body = await readBody(req, 4096);
+      const opts = JSON.parse(body.toString('utf8') || '{}');
+      const name = String(opts.name || '').trim().slice(0, 40) || 'key';
+      const k = 'vg_' + rnd(24);
+      keys[k] = { id: rnd(8), name, createdAt: Date.now(), lastUsedAt: null };
+      saveKeys();
+      return json(res, 200, { key: k, name });
+    }
+
+    const keyDel = p.match(/^\/api\/keys\/([a-z0-9_]+)$/i);
+    if (keyDel && req.method === 'DELETE') {
+      const who = authKey(req, url);
+      if (!isWeb(who)) return json(res, 403, { error: 'нужен web-ключ' });
+      const targetKey = keyDel[1];
+      if (keys[targetKey] && keys[targetKey].id !== WEB_KEY_ID) {
+        keys[targetKey].disabled = true;
+        saveKeys();
+      }
+      return json(res, 200, { ok: true });
+    }
+
+    // every other /api route needs a valid key (static pages stay public)
+    if (!p.startsWith('/api/')) return serveStatic(res, p);
+    const caller = authKey(req, url);
+    if (!caller) return json(res, 401, { error: 'API-ключ не передан или недействителен (X-Api-Key)' });
+    const seesAll = isWeb(caller);
+
     if (p === '/api/jobs' && req.method === 'GET') {
       const list = Object.values(jobs)
+        .filter(j => seesAll || j.key === caller.key)
         .sort((a, b) => b.createdAt - a.createdAt)
         .map(publicJob);
       return json(res, 200, { jobs: list });
@@ -493,7 +585,8 @@ const server = http.createServer(async (req, res) => {
         stage: 'new',
         progress: 0,
         error: null,
-        account: null,
+        key: caller.key,
+        keyLabel: caller.name,
         targetJobId: null,
         videoFile: null,
         createdAt: Date.now(),
@@ -508,15 +601,15 @@ const server = http.createServer(async (req, res) => {
     const jobMatch = p.match(/^\/api\/jobs\/([a-z0-9]+)$/i);
     if (jobMatch && req.method === 'GET') {
       const job = jobs[jobMatch[1]];
-      if (!job) return json(res, 404, { error: 'not found' });
+      if (!job || (!seesAll && job.key !== caller.key)) return json(res, 404, { error: 'not found' });
       return json(res, 200, { job: publicJob(job) });
     }
 
     const vidMatch = p.match(/^\/api\/videos\/([a-z0-9]+)\.mp4$/i);
-    if (vidMatch && req.method === 'GET') return serveVideo(req, res, vidMatch[1]);
-
-    if (p === '/api/config' && req.method === 'GET') {
-      return json(res, 200, { target: TARGET });
+    if (vidMatch && req.method === 'GET') {
+      const job = jobs[vidMatch[1]];
+      if (!job || (!seesAll && job.key !== caller.key)) { res.writeHead(404); res.end('no video'); return; }
+      return serveVideo(req, res, vidMatch[1]);
     }
 
     if (p.startsWith('/api/')) return json(res, 404, { error: 'unknown api' });

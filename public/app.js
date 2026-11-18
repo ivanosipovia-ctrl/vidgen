@@ -27,17 +27,26 @@ const RATIOS = {
 
 const $ = (id) => document.getElementById(id);
 
+// api key: web-ключ приходит с /api/config, храним и шлём везде
+const api = { key: localStorage.getItem('vg_key') || '' };
+function authHeaders(extra) {
+  return Object.assign({ 'X-Api-Key': api.key }, extra || {});
+}
+function videoUrl(id) {
+  return '/api/videos/' + id + '.mp4?key=' + encodeURIComponent(api.key);
+}
+
 const STAGE_TEXT = {
   new: 'очередь...',
-  account: 'создаём свежий аккаунт...',
-  account_ready: 'аккаунт готов',
+  account: 'соединяемся с API...',
+  account_ready: 'API подключён',
   upload_refs: 'загружаем референсы...',
   submitting: 'отправляем генерацию...',
   queued: 'в очереди на источнике...',
-  target_done: 'источник готов — скачиваем к нам...',
+  target_done: 'видео готово — скачиваем к нам...',
   pending_queue: 'в очереди на источнике...',
   submitting_target: 'отправляем...',
-  running: 'источник рендерит видео...',
+  running: 'рендерим видео...',
   downloading: 'скачиваем готовое видео...',
   done: 'готово!',
   error: 'ошибка',
@@ -79,8 +88,8 @@ function setEngine(engine) {
   ratioSel.innerHTML = RATIOS[engine].map(r => `<option value="${r}">${r}</option>`).join('');
 
   $('durationHint').textContent = engine === 'omni'
-    ? 'Veo 3 Free: максимум 8 секунд (10 → 8) • 720p • бесплатный запуск на свежем аккаунте'
-    : 'Seedance 2.0 24/7: 5–15 секунд • 480p/720p • аккаунт создаётся под каждую генерацию';
+    ? 'Veo 3 Free: максимум 8 секунд (10 → 8) • 720p • прямой вызов API'
+    : 'Seedance 2.0 24/7: 5–15 секунд • 480p/720p • прямой вызов API';
 
   $('studioTitle').textContent = engine === 'omni' ? 'Omni Flash — Text to Video' : 'Seedance 2 Pro — Text to Video';
   $('studioSub').textContent = engine === 'omni'
@@ -151,7 +160,7 @@ function renderStage(job) {
   }
 
   if (job.hasVideo && job.status === 'done') {
-    video.src = '/api/videos/' + job.id + '.mp4';
+    video.src = videoUrl(job.id);
     video.classList.remove('hidden');
     video.play().catch(() => {});
     return;
@@ -161,14 +170,13 @@ function renderStage(job) {
   const key = job.stage || job.status || 'new';
   $('stageStage').textContent = STAGE_TEXT[key] || key;
   $('stageBar').style.width = (job.progress || 0) + '%';
-  const acc = job.account ? `аккаунт: ${job.account} • ` : '';
-  $('stageHint').textContent = acc + (job.engine ? `источник: ${job.engine}` : 'подготовка источника');
+  $('stageHint').textContent = job.engine ? `движок: ${job.engine}` : 'подключение к API';
 }
 
 // ---------------------------------------------------------------- jobs
 async function fetchJobs() {
   try {
-    const r = await fetch('/api/jobs');
+    const r = await fetch('/api/jobs', { headers: authHeaders() });
     const d = await r.json();
     state.jobs = d.jobs || [];
   } catch (e) { return; }
@@ -222,7 +230,7 @@ function renderHistory() {
     thumb.className = 'hist-thumb';
     if (j.hasVideo) {
       const v = document.createElement('video');
-      v.src = '/api/videos/' + j.id + '.mp4';
+      v.src = videoUrl(j.id);
       v.muted = true;
       v.preload = 'metadata';
       thumb.appendChild(v);
@@ -251,12 +259,12 @@ function renderHistory() {
 
     const time = document.createElement('div');
     time.className = 'hist-time';
-    time.textContent = new Date(j.createdAt).toLocaleString('ru-RU') + (j.account ? ` • ${j.account}` : '');
+    time.textContent = new Date(j.createdAt).toLocaleString('ru-RU') + (j.keyLabel ? ` • ${j.keyLabel}` : '');
 
     const actions = document.createElement('div');
     actions.className = 'hist-actions';
     actions.innerHTML = j.hasVideo
-      ? `<a href="/api/videos/${j.id}.mp4" download="video_${j.id}.mp4">⬇ Скачать</a>
+      ? `<a href="${videoUrl(j.id)}" download="video_${j.id}.mp4">⬇ Скачать</a>
          <button data-open="${j.id}">▶ Показать</button>`
       : (j.status === 'error' ? `<span class="tag red" title="${(j.error || '').replace(/"/g, '')}">${(j.error || 'ошибка').slice(0, 80)}</span>` : '');
 
@@ -306,14 +314,14 @@ async function submit() {
   try {
     const r = await fetch('/api/generate', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(payload),
     });
     const d = await r.json();
     if (!r.ok || d.error) throw new Error(d.error || 'запрос отклонён');
     state.activeJobId = d.job.id;
     state.lastPrompt = prompt;
-    showAlert('✨ Генерация запущена — аккаунт создаётся прямо сейчас', 'success');
+    showAlert('✨ Генерация запущена — запрос принят API', 'success');
     $('bulkPromptsInput').value = '';
     updateCounter();
     setView('stage');
@@ -332,11 +340,99 @@ function updateCounter() {
   $('charCount').textContent = n + ' символов';
 }
 
+// ---------------------------------------------------------------- api keys modal
+async function apiGet(path, opts) {
+  const r = await fetch(path, Object.assign({ headers: authHeaders() }, opts || {}));
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || 'ошибка ' + r.status);
+  return d;
+}
+
+async function renderKeys() {
+  const box = $('apiKeyList');
+  try {
+    const d = await apiGet('/api/keys');
+    if (!d.keys || !d.keys.length) {
+      box.innerHTML = '<div class="key-empty">Ключей пока нет — создайте первый</div>';
+      return;
+    }
+    box.innerHTML = '';
+    for (const k of d.keys) {
+      const row = document.createElement('div');
+      row.className = 'key-row';
+      const created = new Date(k.createdAt).toLocaleDateString('ru-RU');
+      const used = k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleString('ru-RU') : 'не использовался';
+      const isWeb = k.id === 'web';
+      row.innerHTML = `
+        <div style="min-width:0">
+          <div class="key-name">${escapeHtml(k.name)}${isWeb ? ' · сайт' : ''}</div>
+          <div class="key-meta">создан ${created} • последний запрос: ${used}</div>
+        </div>
+        <div class="key-val">${escapeHtml(k.key.slice(0, 10))}…${escapeHtml(k.key.slice(-4))}</div>
+        <button data-copy="${escapeHtml(k.key)}">копировать</button>
+        ${isWeb ? '' : `<button data-revoke="${escapeHtml(k.key)}">удалить</button>`}`;
+      box.appendChild(row);
+    }
+    box.querySelectorAll('[data-copy]').forEach(b => {
+      b.onclick = async () => {
+        try { await navigator.clipboard.writeText(b.dataset.copy); b.textContent = 'скопировано'; } catch (e) {}
+        setTimeout(() => { b.textContent = 'копировать'; }, 1500);
+      };
+    });
+    box.querySelectorAll('[data-revoke]').forEach(b => {
+      b.onclick = async () => {
+        try { await apiGet('/api/keys/' + b.dataset.revoke, { method: 'DELETE' }); } catch (e) {}
+        renderKeys();
+      };
+    });
+  } catch (e) {
+    box.innerHTML = '<div class="key-empty">' + escapeHtml(e.message) + '</div>';
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function openApi() {
+  $('apiModal').classList.remove('hidden');
+  renderKeys();
+}
+function closeApi() { $('apiModal').classList.add('hidden'); }
+
+async function initKeys() {
+  $('navApi').addEventListener('click', openApi);
+  $('apiClose').addEventListener('click', closeApi);
+  $('apiModal').addEventListener('click', (e) => { if (e.target === $('apiModal')) closeApi(); });
+  $('apiKeyForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const name = $('apiKeyName').value.trim();
+    if (!name) return;
+    try {
+      const d = await apiGet('/api/keys', { method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ name }) });
+      const box = $('apiKeyNew');
+      box.className = 'alert';
+      box.textContent = 'Новый ключ: ' + d.key + ' — скопируйте и сохраните, он не показывается снова.';
+      $('apiKeyName').value = '';
+      renderKeys();
+    } catch (err) {
+      const box = $('apiKeyNew');
+      box.className = 'alert error';
+      box.textContent = err.message;
+    }
+  });
+}
+
 // ---------------------------------------------------------------- init
-function init() {
-  fetch('/api/config').then(r => r.json()).then(d => {
-    $('targetBadge').textContent = 'источник: ' + (d.target || '—');
-  }).catch(() => {});
+async function init() {
+  try {
+    const d = await (await fetch('/api/config')).json();
+    if (d.webKey) {
+      api.key = d.webKey;
+      localStorage.setItem('vg_key', d.webKey);
+    }
+    $('targetBadge').textContent = 'API: ' + (d.target || '—');
+  } catch (e) {}
 
   document.querySelectorAll('.engine-btn').forEach(b => {
     b.addEventListener('click', () => setEngine(b.dataset.engine));
@@ -373,6 +469,7 @@ function init() {
   setEngine('omni');
   renderRefs();
   updateCounter();
+  initKeys();
   fetchJobs();
   startPolling();
 }

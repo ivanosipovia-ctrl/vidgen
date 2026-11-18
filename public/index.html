@@ -23,10 +23,12 @@
         <button class="nav-link active">🎬 Создать видео</button>
         <p class="nav-group-title">Библиотека</p>
         <button class="nav-link" id="navHistory">🕒 История (<span id="sideJobCount">0</span>)</button>
+        <p class="nav-group-title">Интеграции</p>
+        <button class="nav-link" id="navApi">🔑 API-ключи</button>
       </nav>
 
       <div class="side-footer">
-        Каждый запуск — свежий аккаунт через emailnator.<br />Видео скачивается и хранится у нас.
+        Работаем напрямую с реальным API генерации.<br />Видео скачивается и хранится у нас.
       </div>
     </aside>
 
@@ -63,7 +65,7 @@
                   ⚡ Seedance 2 Pro <small>2.0 24/7 · 5–15 сек</small>
                 </button>
               </div>
-              <div class="quota-bar" id="quotaBar">Свежий аккаунт создаётся под каждую генерацию</div>
+              <div class="quota-bar" id="quotaBar">Прямое подключение к API — без посредников</div>
 
               <!-- model -->
               <div>
@@ -135,9 +137,9 @@
 
               <div class="stage-loading hidden" id="stageLoading">
                 <div class="spinner"></div>
-                <p class="stage-stage" id="stageStage">account</p>
+                <p class="stage-stage" id="stageStage">подготовка</p>
                 <div class="progress"><div class="progress-bar" id="stageBar"></div></div>
-                <p class="stage-hint" id="stageHint">создаём аккаунт...</p>
+                <p class="stage-hint" id="stageHint">соединяемся с API...</p>
               </div>
 
               <video class="stage-video hidden" id="stageVideo" controls playsinline></video>
@@ -153,6 +155,45 @@
           </section>
         </div>
       </main>
+    </div>
+  </div>
+
+  <!-- API keys modal -->
+  <div class="modal-back hidden" id="apiModal">
+    <div class="modal">
+      <div class="modal-head">
+        <div>
+          <h2>API-ключи</h2>
+          <p>Доступ для внешних приложений. Ключ передаётся заголовком <code>X-Api-Key</code>.</p>
+        </div>
+        <button class="btn-ghost" id="apiClose">✕</button>
+      </div>
+
+      <div class="modal-body">
+        <form id="apiKeyForm" class="key-form">
+          <input type="text" id="apiKeyName" class="select" placeholder="Название (бот, сайт, скрипт)" maxlength="40" />
+          <button type="submit" class="btn-accent">+ Создать ключ</button>
+        </form>
+
+        <div id="apiKeyNew" class="alert hidden"></div>
+        <div id="apiKeyList" class="key-list"></div>
+
+        <div class="api-docs">
+          <p class="field-label">Как вызывать</p>
+<pre>POST /api/generate
+X-Api-Key: vg_ваш_ключ
+Content-Type: application/json
+
+{ "model": "omni", "prompt": "зачем видео",
+  "duration": 8, "resolution": 720,
+  "ratio": "16:9", "audio": true }
+
+GET  /api/jobs            — список задач
+GET  /api/jobs/{id}       — статус одной
+GET  /api/videos/{id}.mp4 — скачать видео</pre>
+          <p class="api-note">Задачи, созданные ключом, видны только ему. Веб-интерфейс работает как ключ «web».</p>
+        </div>
+      </div>
     </div>
   </div>
 
