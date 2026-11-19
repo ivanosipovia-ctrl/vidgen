@@ -38,10 +38,24 @@ for (const dir of [DATA_DIR, VIDEO_DIR]) {
 // site UI can authenticate; external apps get their own keys via POST /api/keys
 const KEYS_FILE = path.join(DATA_DIR, 'keys.json');
 const WEB_KEY_ID = 'web';
+// WEB_KEY задаётся в настройках хостинга — тогда web-ключ не меняется
+// между редеплоями (на бесплатном тарифе диск эфемерный)
+const WEB_KEY_ENV = String(process.env.WEB_KEY || '').trim();
 
 let keys = {};
 if (fs.existsSync(KEYS_FILE)) {
   try { keys = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8')); } catch (e) { keys = {}; }
+}
+// сервер мог быть развёрнут заново — старые ключи из localStorage не должны
+// ломать сайт: web-ключ берётся из WEB_KEY (если задан) или создаётся заново
+if (WEB_KEY_ENV) {
+  const oldWeb = Object.entries(keys).find(([, v]) => v && v.id === WEB_KEY_ID && !v.disabled);
+  if (!oldWeb || oldWeb[0] !== WEB_KEY_ENV) {
+    if (oldWeb) { keys[oldWeb[0]].disabled = true; }
+    keys[WEB_KEY_ENV] = { id: WEB_KEY_ID, name: 'web', createdAt: Date.now(), lastUsedAt: null };
+    // иначе файл на диске остался бы со старым web-ключом
+    saveKeys();
+  }
 }
 function saveKeys() {
   try { fs.writeFileSync(KEYS_FILE, JSON.stringify(keys, null, 2)); } catch (e) {}
@@ -509,10 +523,13 @@ const server = http.createServer(async (req, res) => {
   try {
     if (p === '/api/config' && req.method === 'GET') {
       // web-ключ отдаём только браузеру с нашего же хоста — внешние приложения
-      // берут собственные ключи через POST /api/keys
+      // берут собственные ключи через POST /api/keys.
+      // Referer/Origin могут отсутствовать (Referrer-Policy, приватный режим),
+      // поэтому доверяем и sec-fetch-site: same-origin
       const host = req.headers.host || '';
       const src = String(req.headers.origin || req.headers.referer || '');
-      const sameOrigin = src.includes(host);
+      const fetchSite = String(req.headers['sec-fetch-site'] || '');
+      const sameOrigin = src.includes(host) || fetchSite === 'same-origin';
       return json(res, 200, Object.assign({ target: TARGET }, sameOrigin ? { webKey: WEB_KEY } : {}));
     }
 

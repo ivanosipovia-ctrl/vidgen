@@ -28,12 +28,59 @@ const RATIOS = {
 const $ = (id) => document.getElementById(id);
 
 // api key: web-ключ приходит с /api/config, храним и шлём везде
-const api = { key: localStorage.getItem('vg_key') || '' };
+const api = { key: localStorage.getItem('vg_key') || '', refresh: null };
 function authHeaders(extra) {
   return Object.assign({ 'X-Api-Key': api.key }, extra || {});
 }
 function videoUrl(id) {
   return '/api/videos/' + id + '.mp4?key=' + encodeURIComponent(api.key);
+}
+
+// сервер мог перезапуститься / redeploy — web-ключ другой. тянем его заново
+// (без кэша) и сохраняем. один запрос в параллели на все вызовы
+function refreshKey() {
+  if (!api.refresh) {
+    api.refresh = fetch('/api/config', { cache: 'no-store' })
+      .then(r => r.json())
+      .then(d => {
+        if (d.webKey && d.webKey !== api.key) {
+          api.key = d.webKey;
+          localStorage.setItem('vg_key', d.webKey);
+          syncVideoUrls(); // <video> уже получил src со старым ключом
+        }
+        return api.key;
+      })
+      .catch(() => api.key)
+      .finally(() => { api.refresh = null; });
+  }
+  return api.refresh;
+}
+
+// переписываем src у всех плееров, если ключ сменился
+function syncVideoUrls() {
+  document.querySelectorAll('video[src*="/api/videos/"]').forEach(v => {
+    const id = (v.getAttribute('src') || '').match(/\/api\/videos\/([a-z0-9]+)\.mp4/i);
+    if (!id) return;
+    const next = videoUrl(id[1]);
+    if (v.src !== new URL(next, location.href).href) v.src = next;
+  });
+}
+
+// fetch с авторизацией: при 401 один раз обновляем ключ и повторяем запрос.
+// заголовок ставим здесь же — вызывающий код мог собрать его со старым ключом
+async function apiFetch(url, opts) {
+  const withKey = (o) => {
+    const n = Object.assign({}, o || {});
+    n.headers = Object.assign({}, (o && o.headers) || {}, { 'X-Api-Key': api.key });
+    return n;
+  };
+  let r = await fetch(url, withKey(opts));
+  if (r.status === 401 || r.status === 403) {
+    const before = api.key;
+    await refreshKey();
+    if (api.key && api.key !== before) r = await fetch(url, withKey(opts));
+  }
+  return r;
 }
 
 const STAGE_TEXT = {
@@ -160,9 +207,10 @@ function renderStage(job) {
   }
 
   if (job.hasVideo && job.status === 'done') {
-    video.src = videoUrl(job.id);
+    const next = videoUrl(job.id);
+    if (video.src !== new URL(next, location.href).href) video.src = next; // не сбрасываем воспроизведение
     video.classList.remove('hidden');
-    video.play().catch(() => {});
+    if (video.paused) video.play().catch(() => {});
     return;
   }
 
@@ -176,7 +224,7 @@ function renderStage(job) {
 // ---------------------------------------------------------------- jobs
 async function fetchJobs() {
   try {
-    const r = await fetch('/api/jobs', { headers: authHeaders() });
+    const r = await apiFetch('/api/jobs', { headers: authHeaders(), cache: 'no-store' });
     const d = await r.json();
     state.jobs = d.jobs || [];
   } catch (e) { return; }
@@ -312,7 +360,7 @@ async function submit() {
 
   $('btnSubmitBatch').disabled = true;
   try {
-    const r = await fetch('/api/generate', {
+    const r = await apiFetch('/api/generate', {
       method: 'POST',
       headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(payload),
@@ -342,7 +390,7 @@ function updateCounter() {
 
 // ---------------------------------------------------------------- api keys modal
 async function apiGet(path, opts) {
-  const r = await fetch(path, Object.assign({ headers: authHeaders() }, opts || {}));
+  const r = await apiFetch(path, Object.assign({ headers: authHeaders(), cache: 'no-store' }, opts || {}));
   const d = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(d.error || 'ошибка ' + r.status);
   return d;
@@ -426,7 +474,7 @@ async function initKeys() {
 // ---------------------------------------------------------------- init
 async function init() {
   try {
-    const d = await (await fetch('/api/config')).json();
+    const d = await (await fetch('/api/config', { cache: 'no-store' })).json();
     if (d.webKey) {
       api.key = d.webKey;
       localStorage.setItem('vg_key', d.webKey);
