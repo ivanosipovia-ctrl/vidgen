@@ -176,6 +176,7 @@ function publicJob(j) {
     targetModel: j.targetModel,
     prompt: j.prompt,
     duration: j.duration,
+    requestedDuration: j.requestedDuration || null, // если 10 → 8: показываем оба
     resolution: j.resolution,
     ratio: j.ratio,
     audio: j.audio,
@@ -265,15 +266,76 @@ async function createAccount() {
 }
 
 // ---------------------------------------------------------------- generation
-const OMNI_DURATION_MAP = { 4: 4, 6: 6, 8: 8, 10: 8 }; // veo cluster caps at 8s: 10 -> 8
+// Veo (server11) принимает только 4/6/8 — их сервер отклоняет 10
+// (проверено: "Server 11 hỗ trợ các mức thời lượng 4s, 6s và 8s").
+// Для 10с — кластер Gencpu Free с фронта 160.30.161.35 (selectGencpuFreeCluster):
+// server7 "Seedance 2.5 Lite" (5/10/15с, free 0d, быстрый фейл при OOM → повтор),
+// фолбэк server10 "Gencpu 1.1" (10–30с, 720p).
+const OMNI_DURATIONS = [4, 6, 8, 10];
+function omniDuration(d) {
+  d = Number(d);
+  return OMNI_DURATIONS.includes(d) ? d : 8;
+}
 
 function buildBatchPayload(opts) {
   const prompt = String(opts.prompt || '').trim();
   const imageAssetIds = opts.imageAssetIds || [];
 
   if (opts.model === 'omni') {
-    const duration = OMNI_DURATION_MAP[Number(opts.duration)] || 8;
+    const duration = omniDuration(opts.duration);
     const ratio = ['16:9', '9:16', 'auto'].includes(opts.ratio) ? opts.ratio : '16:9';
+
+    if (duration === 10) {
+      // 10с: настройки как на фото (720p, 16:9, audio, 1 видео), кластер Gencpu Free.
+      // Приоритет: server7 (Seedance 2.5 Lite, 2116 готовых потоков, free 0d,
+      // падает быстро при OOM → повтор), потом server10 (Gencpu 1.1, 720p).
+      const base10 = {
+        useSeedanceHub: false,
+        useServer3: false, useServer4: false, useServer5: false, useServer6: false,
+        useServer7: false, useServer8: false, useServer9: false,
+        useServer10: true, useServer11: false, useServer12: false, useServer13: false, useServer14: false,
+        useSv9Fallback: false,
+        op: imageAssetIds.length ? 'i2v' : 't2v',
+        i2vMode: 'by-name',
+        i2vSlotType: 'start',
+        imageAssetIds,
+        refVidAssetIds: [],
+        refAudioAssetIds: [],
+        duration,
+        resolution: 720,
+        ratio,
+        audio: opts.audio !== false,
+        autoSanitizeVpcs: true,
+        prompts: [prompt],
+      };
+      const sv7 = Object.assign({}, base10, {
+        model: 'Seedance 2.5 Lite',
+        serverEngine: 'server7',
+        useServer10: false,
+        useServer7: true,
+        engine: 'server7',
+        cookieSource: 'server7',
+        sv7Mode: 'gencpu_video',
+      });
+      const sv10 = Object.assign({}, base10, {
+        model: 'Gencpu 1.1',
+        serverEngine: 'server10',
+        engine: 'server10',
+        cookieSource: 'server10',
+      });
+      const at7 = { payload: sv7, duration, engine: 'server7', targetModel: 'Seedance 2.5 Lite' };
+      const at10 = { payload: sv10, duration, engine: 'server10', targetModel: 'Gencpu 1.1' };
+      return {
+        payload: sv7,
+        duration,
+        engine: 'server7',
+        targetModel: 'Seedance 2.5 Lite',
+        // OOM на server7 лечится «через несколько минут» — повторяем; server10
+        // в конце и только если у него живой пул (иначе очередь висит вечно)
+        fallbacks: [at7, at7, at10],
+      };
+    }
+
     const veoModels = ['Veo 3.1 Fast', 'Veo 3.2 Fast', 'Veo 3.1 Lite'];
     const veoModel = veoModels.includes(opts.targetModel) ? opts.targetModel : 'Veo 3.1 Fast';
     return {
@@ -399,58 +461,95 @@ async function runJob(job) {
     }
 
     const built = buildBatchPayload({ ...job, imageAssetIds });
-    job.engine = built.engine;
-    job.targetModel = built.targetModel;
-    job.duration = built.duration;
+    const attempts = [built].concat(built.fallbacks || []);
 
     job.stage = 'submitting';
     job.progress = 15;
     saveJobs();
 
-    const r = await targetPost('/api/batches', built.payload, acc.token);
-    if (!r.data || !r.data.ok) {
-      throw new Error('target rejected batch: ' + (r.text || '').slice(0, 500));
-    }
-    const first = (r.data.jobs || [])[0];
-    if (!first || !first.id) throw new Error('no job id returned: ' + (r.text || '').slice(0, 400));
-    job.targetJobId = first.id;
-    job.stage = 'queued';
-    job.progress = 20;
-    saveJobs();
-
-    // poll
-    const startedAt = Date.now();
-    const DEADLINE = 15 * 60 * 1000;
-    let targetJob = null;
-    while (Date.now() - startedAt < DEADLINE) {
-      await sleep(5000);
-      const st = await targetGet('/api/state', acc.token);
-      if (!st.data) continue;
-      const list = st.data.myJobs || st.data.jobs || [];
-      targetJob = list.find(j => j && j.id === job.targetJobId) || null;
-      if (targetJob) {
-        const s = targetJob.status;
-        if (s === 'done' || s === 'completed') {
-          job.progress = 95;
-          job.stage = 'target_done'; // NOT status=done yet — video still has to land here
-        } else if (s === 'error' || s === 'failed' || s === 'canceled') {
-          job.status = s;
-          job.stage = 'error';
-          if (targetJob.error) job.error = String(targetJob.error);
+    // опрос целевого джобы; при ошибе/таймауте — переход на следующую попытку
+    const pollTarget = async () => {
+      const startedAt = Date.now();
+      const DEADLINE = 15 * 60 * 1000;
+      let targetJob = null;
+      while (Date.now() - startedAt < DEADLINE) {
+        await sleep(5000);
+        const st = await targetGet('/api/state', acc.token);
+        if (!st.data) continue;
+        const list = st.data.myJobs || st.data.jobs || [];
+        targetJob = list.find(j => j && j.id === job.targetJobId) || null;
+        if (targetJob) {
+          const s = targetJob.status;
+          if (s === 'done' || s === 'completed') {
+            job.progress = 95;
+            job.stage = 'target_done'; // NOT status=done yet — video still has to land here
+          } else if (s === 'error' || s === 'failed' || s === 'canceled') {
+            job.status = s;
+            job.stage = 'error';
+            if (targetJob.error) job.error = String(targetJob.error);
+            saveJobs();
+            throw new Error('target job failed: ' + (targetJob.error || s));
+          } else {
+            job.status = s;
+            job.progress = Math.min(95, 25 + Math.round(Number(targetJob.progress || 0)));
+            job.stage = s;
+            if (targetJob.error) job.error = String(targetJob.error);
+          }
           saveJobs();
-          throw new Error('target job failed: ' + (targetJob.error || s));
-        } else {
-          job.status = s;
-          job.progress = Math.min(95, 25 + Math.round(Number(targetJob.progress || 0)));
-          job.stage = s;
-          if (targetJob.error) job.error = String(targetJob.error);
+          if (job.stage === 'target_done') break;
         }
+      }
+      if (!targetJob || !['done', 'completed'].includes(targetJob.status)) {
+        throw new Error('timeout waiting for target job');
+      }
+    };
+
+    let done = false;
+    const attemptErrs = [];
+    for (let ai = 0; ai < attempts.length; ai++) {
+      const attempt = attempts[ai];
+      // server10 без живого пула (readyStreams=0) не отправляем — job повиснет в очереди навсегда
+      if (attempt.engine === 'server10') {
+        try {
+          const st = await targetGet('/api/state', acc.token);
+          if (st.data && st.data.server10 && Number(st.data.server10.readyStreams || 0) === 0) {
+            attemptErrs.push('Gencpu 1.1: пул потоков пуст — пропуск');
+            continue;
+          }
+        } catch (e) {}
+      }
+      try {
+        const r = await targetPost('/api/batches', attempt.payload, acc.token);
+        if (!r.data || !r.data.ok) {
+          throw new Error('target rejected batch: ' + (r.text || '').slice(0, 300));
+        }
+        const first = (r.data.jobs || [])[0];
+        if (!first || !first.id) throw new Error('no job id returned: ' + (r.text || '').slice(0, 300));
+        job.engine = attempt.engine;
+        job.targetModel = attempt.targetModel;
+        job.duration = attempt.duration;
+        job.targetJobId = first.id;
+        job.status = 'pending';
+        job.error = null;
+        job.stage = 'queued';
+        job.progress = 20;
         saveJobs();
-        if (job.stage === 'target_done') break;
+        await pollTarget();
+        done = true;
+        break;
+      } catch (e) {
+        attemptErrs.push((attempt.targetModel || attempt.engine) + ': ' + String(e && e.message || e).slice(0, 300));
+        job.targetJobId = null;
+        job.status = 'pending';
+        job.error = null;
+        job.stage = 'submitting';
+        saveJobs();
+        if (ai < attempts.length - 1) await sleep(60000);
       }
     }
-    if (!targetJob || !['done', 'completed'].includes(targetJob.status)) {
-      throw new Error('timeout waiting for target job');
+    if (!done) {
+      throw new Error('Gencpu Free (10с) сейчас недоступен — попробуй позже. '
+        + attemptErrs.join(' | ').slice(0, 700));
     }
 
     // download
@@ -687,13 +786,20 @@ const server = http.createServer(async (req, res) => {
       if (!prompt) return json(res, 400, { error: 'prompt empty' });
       if (!['omni', 'seedance'].includes(opts.model)) return json(res, 400, { error: 'bad model' });
       const refs = Array.isArray(opts.refs) ? opts.refs.slice(0, 9) : [];
+      const reqDur = Number(opts.duration) || (opts.model === 'omni' ? 8 : 10);
+      // фактическая длительность считается сразу — вызывающий видит её в ответе:
+      // 4/6/8 → Veo (server11), 10 → Gencpu Free (server10, реальные 10с)
+      const actualDur = opts.model === 'omni'
+        ? omniDuration(reqDur)
+        : ([5, 8, 10, 12, 15].includes(reqDur) ? reqDur : 10);
       const job = {
         id: 'j' + Date.now().toString(36) + rnd(4),
         model: opts.model,
-        engine: opts.model === 'omni' ? 'server11' : 'server2',
+        engine: opts.model === 'omni' ? (actualDur === 10 ? 'server7' : 'server11') : 'server2',
         targetModel: null,
         prompt,
-        duration: Number(opts.duration) || (opts.model === 'omni' ? 8 : 10),
+        duration: actualDur,
+        requestedDuration: actualDur !== reqDur ? reqDur : null,
         resolution: Number(opts.resolution) || (opts.model === 'omni' ? 720 : 480),
         ratio: opts.ratio || '16:9',
         audio: opts.audio !== false,

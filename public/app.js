@@ -116,7 +116,7 @@ function setEngine(engine) {
   const prev = Number(durSel.value);
   const durs = DURATIONS[engine];
   durSel.innerHTML = durs.map(d => {
-    const note = (engine === 'omni' && d === 10) ? ' (будет 8 — лимит Veo)' : '';
+    const note = (engine === 'omni' && d === 10) ? ' (Gencpu Free — реальные 10с)' : '';
     return `<option value="${d}">${d} сек${note}</option>`;
   }).join('');
   if (durs.includes(prev)) durSel.value = String(prev);
@@ -135,7 +135,7 @@ function setEngine(engine) {
   ratioSel.innerHTML = RATIOS[engine].map(r => `<option value="${r}">${r}</option>`).join('');
 
   $('durationHint').textContent = engine === 'omni'
-    ? 'Veo 3 Free: максимум 8 секунд (10 → 8) • 720p • прямой вызов API'
+    ? '4/6/8 сек → Veo 3 Free • 10 сек → Gencpu Free (Seedance 2.5 Lite / Gencpu 1.1) • 720p'
     : 'Seedance 2.0 24/7: 5–15 секунд • 480p/720p • прямой вызов API';
 
   $('studioTitle').textContent = engine === 'omni' ? 'Omni Flash — Text to Video' : 'Seedance 2 Pro — Text to Video';
@@ -298,7 +298,7 @@ function renderHistory() {
     tags.innerHTML = [
       `<span class="tag">${j.model === 'omni' ? 'Omni Flash' : 'Seedance 2 Pro'}</span>`,
       `<span class="tag grey">${j.targetModel || '—'}</span>`,
-      `<span class="tag grey">${j.duration}с</span>`,
+      `<span class="tag grey">${j.requestedDuration ? j.requestedDuration + '→' + j.duration + 'с' : j.duration + 'с'}</span>`,
       `<span class="tag grey">${j.resolution}p</span>`,
       `<span class="tag grey">${j.ratio}</span>`,
       j.status === 'error' ? '<span class="tag red">ошибка</span>' : '',
