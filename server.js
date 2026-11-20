@@ -36,40 +36,79 @@ for (const dir of [DATA_DIR, VIDEO_DIR]) {
 // data/keys.json: { "<key>": { id, name, createdAt, lastUsedAt, disabled } }
 // the built-in "web" key is auto-provisioned and returned by /api/config so the
 // site UI can authenticate; external apps get their own keys via POST /api/keys
+//
+// На хостинге с эфемерным диском (Render free) keys.json стирается при каждом
+// рестарте/редеплое, поэтому ключи НЕ зависят от файла:
+//   * web-ключ берётся из переменной окружения WEB_KEY — он не меняется никогда;
+//   * каждый новый ключ несёт HMAC-метку от секрета (WEB_KEY/KEY_SECRET из
+//     окружения, локально — data/secret.txt) и действует даже без записи на диске;
+//   * список ключей браузер восстанавливает через POST /api/keys/sync.
 const KEYS_FILE = path.join(DATA_DIR, 'keys.json');
+const SECRET_FILE = path.join(DATA_DIR, 'secret.txt');
 const WEB_KEY_ID = 'web';
-// WEB_KEY задаётся в настройках хостинга — тогда web-ключ не меняется
-// между редеплоями (на бесплатном тарифе диск эфемерный)
 const WEB_KEY_ENV = String(process.env.WEB_KEY || '').trim();
+const KEY_SECRET_ENV = String(process.env.KEY_SECRET || '').trim();
+const ON_RENDER = Boolean(process.env.RENDER);
+
+function loadOrCreateSecret() {
+  try {
+    if (fs.existsSync(SECRET_FILE)) {
+      const s = fs.readFileSync(SECRET_FILE, 'utf8').trim();
+      if (s) return s;
+    }
+  } catch (e) {}
+  const s = rnd(48);
+  try { fs.writeFileSync(SECRET_FILE, s); } catch (e) {}
+  return s;
+}
+// секрет HMAC: окружение переживает редеплой, файл — только локально
+const KEY_SECRET = KEY_SECRET_ENV || WEB_KEY_ENV || loadOrCreateSecret();
 
 let keys = {};
 if (fs.existsSync(KEYS_FILE)) {
   try { keys = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8')); } catch (e) { keys = {}; }
 }
-// сервер мог быть развёрнут заново — старые ключи из localStorage не должны
-// ломать сайт: web-ключ берётся из WEB_KEY (если задан) или создаётся заново
-if (WEB_KEY_ENV) {
-  const oldWeb = Object.entries(keys).find(([, v]) => v && v.id === WEB_KEY_ID && !v.disabled);
-  if (!oldWeb || oldWeb[0] !== WEB_KEY_ENV) {
-    if (oldWeb) { keys[oldWeb[0]].disabled = true; }
-    keys[WEB_KEY_ENV] = { id: WEB_KEY_ID, name: 'web', createdAt: Date.now(), lastUsedAt: null };
-    // иначе файл на диске остался бы со старым web-ключом
-    saveKeys();
-  }
-}
 function saveKeys() {
   try { fs.writeFileSync(KEYS_FILE, JSON.stringify(keys, null, 2)); } catch (e) {}
+}
+function hmacHex(input) {
+  return crypto.createHmac('sha256', KEY_SECRET).update(String(input)).digest('hex');
+}
+// ключ вида vg_<8 hex id><16 hex метка>: метка выводится из секрета,
+// поэтому такой ключ принимается сервером и когда keys.json утрачен
+function statelessValid(k) {
+  const m = /^vg_([0-9a-f]{8})([0-9a-f]{16})$/i.exec(String(k || ''));
+  if (!m) return false;
+  const expect = hmacHex('key:' + m[1].toLowerCase()).slice(0, 16);
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expect), Buffer.from(m[2].toLowerCase()));
+  } catch (e) { return false; }
 }
 function findWebKey() {
   for (const [k, v] of Object.entries(keys)) if (v && v.id === WEB_KEY_ID && !v.disabled) return k;
   return null;
 }
-if (!findWebKey()) {
-  const k = 'vg_' + rnd(24);
-  keys[k] = { id: WEB_KEY_ID, name: 'web', createdAt: Date.now(), lastUsedAt: null };
+// web-ключ: WEB_KEY из окружения > производный от секрета > с диска > новый
+let webKey = WEB_KEY_ENV
+  || (KEY_SECRET_ENV ? 'vg_' + hmacHex('web').slice(0, 24) : null)
+  || findWebKey()
+  || 'vg_' + rnd(24);
+if (!keys[webKey] || keys[webKey].id !== WEB_KEY_ID) {
+  const oldWeb = Object.entries(keys).find(([, v]) => v && v.id === WEB_KEY_ID && !v.disabled);
+  if (oldWeb && oldWeb[0] !== webKey) keys[oldWeb[0]].disabled = true;
+  keys[webKey] = { id: WEB_KEY_ID, name: 'web', createdAt: Date.now(), lastUsedAt: null };
+  saveKeys(); // иначе файл на диске остался бы со старым web-ключом
+} else if (keys[webKey].disabled) {
+  delete keys[webKey].disabled;
   saveKeys();
 }
-const WEB_KEY = findWebKey();
+const WEB_KEY = webKey;
+// локально диск постоянный — ключи и так стабильны; на эфемерном диске
+// без переменной окружения они будут меняться при каждом рестарте
+const STABLE_KEYS = Boolean(KEY_SECRET_ENV || WEB_KEY_ENV) || !ON_RENDER;
+if (!STABLE_KEYS) {
+  console.warn('ВНИМАНИЕ: задайте переменную окружения WEB_KEY — иначе ключи изменятся после каждого редеплоя');
+}
 
 function keyFrom(req, url) {
   const h = req.headers['x-api-key'] || req.headers['authorization'] || '';
@@ -82,10 +121,22 @@ function keyFrom(req, url) {
 function authKey(req, url) {
   const k = keyFrom(req, url);
   if (!k) return null;
+  if (k === WEB_KEY) {
+    if (keys[k]) keys[k].lastUsedAt = Date.now();
+    return { key: k, id: WEB_KEY_ID, name: 'web' };
+  }
   const rec = keys[k];
-  if (!rec || rec.disabled) return null;
-  rec.lastUsedAt = Date.now();
-  return { key: k, ...rec };
+  if (rec) {
+    if (rec.disabled) return null; // отзыв действует, пока запись на диске
+    rec.lastUsedAt = Date.now();
+    return { key: k, ...rec };
+  }
+  // keys.json утрачен (эфемерный диск) — ключ всё равно действует,
+  // если HMAC-метка сходится с секретом из окружения
+  if (statelessValid(k)) {
+    return { key: k, id: k.slice(3, 11), name: 'внешний ключ', stateless: true };
+  }
+  return null;
 }
 function isWeb(rec) { return rec && rec.id === WEB_KEY_ID; }
 
@@ -530,15 +581,21 @@ const server = http.createServer(async (req, res) => {
       const src = String(req.headers.origin || req.headers.referer || '');
       const fetchSite = String(req.headers['sec-fetch-site'] || '');
       const sameOrigin = src.includes(host) || fetchSite === 'same-origin';
-      return json(res, 200, Object.assign({ target: TARGET }, sameOrigin ? { webKey: WEB_KEY } : {}));
+      return json(res, 200, Object.assign({ target: TARGET, stableKeys: STABLE_KEYS }, sameOrigin ? { webKey: WEB_KEY } : {}));
     }
 
     if (p === '/api/keys' && req.method === 'GET') {
       const who = authKey(req, url);
       if (!isWeb(who)) return json(res, 403, { error: 'нужен web-ключ' });
+      // disabled включаем в ответ: браузер хранит полный список как бэкап
+      // и восстанавливает его через /api/keys/sync после редеплоя
       const list = Object.entries(keys)
-        .filter(([, v]) => v && !v.disabled)
-        .map(([k, v]) => ({ key: k, id: v.id, name: v.name, createdAt: v.createdAt, lastUsedAt: v.lastUsedAt || null }));
+        .filter(([, v]) => v)
+        .map(([k, v]) => ({
+          key: k, id: v.id, name: v.name,
+          createdAt: v.createdAt, lastUsedAt: v.lastUsedAt || null,
+          disabled: Boolean(v.disabled),
+        }));
       return json(res, 200, { keys: list });
     }
 
@@ -548,10 +605,47 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req, 4096);
       const opts = JSON.parse(body.toString('utf8') || '{}');
       const name = String(opts.name || '').trim().slice(0, 40) || 'key';
-      const k = 'vg_' + rnd(24);
-      keys[k] = { id: rnd(8), name, createdAt: Date.now(), lastUsedAt: null };
+      const id = rnd(8);
+      // stateless-формат: метка от секрета — ключ переживает утрату keys.json
+      const k = 'vg_' + id + hmacHex('key:' + id).slice(0, 16);
+      keys[k] = { id, name, createdAt: Date.now(), lastUsedAt: null };
       saveKeys();
       return json(res, 200, { key: k, name });
+    }
+
+    if (p === '/api/keys/sync' && req.method === 'POST') {
+      // браузер отдаёт свой бэкап списка — восстанавливаем keys.json
+      // после редеплоя (диск эфемерный). Нужен web-ключ.
+      const who = authKey(req, url);
+      if (!isWeb(who)) return json(res, 403, { error: 'нужен web-ключ' });
+      const body = await readBody(req, 64 * 1024);
+      const opts = JSON.parse(body.toString('utf8') || '{}');
+      const list = Array.isArray(opts.keys) ? opts.keys.slice(0, 300) : [];
+      let restored = 0;
+      let changed = false;
+      for (const it of list) {
+        const k = String(it && it.key || '');
+        if (!/^vg_[a-z0-9]{24}$/i.test(k)) continue;
+        if (k === WEB_KEY) continue;
+        const prev = keys[k] || {};
+        const known = Object.keys(prev).length > 0;
+        // без переменной окружения секрет неизвестен — legacy-ключи (старого
+        // формата) проверить нечем, доверяем бэкапу web-ключа
+        if (!known && !statelessValid(k) && !KEY_SECRET_ENV && !WEB_KEY_ENV) continue;
+        const rec = {
+          // id клиента не принимаем — иначе можно было бы выдать свой ключ за web
+          id: prev.id || (statelessValid(k) ? k.slice(3, 11) : rnd(8)),
+          name: String(prev.name || it.name || 'key').slice(0, 40),
+          createdAt: prev.createdAt || Number(it.createdAt) || Date.now(),
+          lastUsedAt: prev.lastUsedAt || Number(it.lastUsedAt) || null,
+        };
+        if (prev.disabled || it.disabled) rec.disabled = true;
+        if (!known) { restored++; changed = true; }
+        else if (Boolean(prev.disabled) !== Boolean(rec.disabled)) changed = true;
+        keys[k] = rec;
+      }
+      if (changed) saveKeys();
+      return json(res, 200, { ok: true, restored });
     }
 
     const keyDel = p.match(/^\/api\/keys\/([a-z0-9_]+)$/i);
@@ -559,8 +653,14 @@ const server = http.createServer(async (req, res) => {
       const who = authKey(req, url);
       if (!isWeb(who)) return json(res, 403, { error: 'нужен web-ключ' });
       const targetKey = keyDel[1];
-      if (keys[targetKey] && keys[targetKey].id !== WEB_KEY_ID) {
-        keys[targetKey].disabled = true;
+      if (targetKey === WEB_KEY || (keys[targetKey] && keys[targetKey].id === WEB_KEY_ID)) {
+        return json(res, 400, { error: 'web-ключ удалить нельзя' });
+      }
+      // принимаем и stateless-ключ, которого ещё нет на диске
+      if (keys[targetKey] || statelessValid(targetKey)) {
+        const rec = keys[targetKey] || { id: targetKey.slice(3, 11), name: 'внешний ключ', createdAt: Date.now(), lastUsedAt: null };
+        rec.disabled = true;
+        keys[targetKey] = rec;
         saveKeys();
       }
       return json(res, 200, { ok: true });

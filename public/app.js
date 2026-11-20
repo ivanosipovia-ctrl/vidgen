@@ -396,16 +396,50 @@ async function apiGet(path, opts) {
   return d;
 }
 
+const KEYS_BACKUP = 'vg_keys_backup';
+function readKeysBackup() {
+  try { return JSON.parse(localStorage.getItem(KEYS_BACKUP) || '[]'); } catch (e) { return []; }
+}
+function writeKeysBackup(list) {
+  try { localStorage.setItem(KEYS_BACKUP, JSON.stringify(list)); } catch (e) {}
+}
+
+// после редеплоя на Render keys.json пуст — восстанавливаем список из бэкапа
+// браузера (сами ключи при этом действуют и так, см. server.js)
+async function loadKeyList() {
+  let list = [];
+  try {
+    const d = await apiGet('/api/keys');
+    list = d.keys || [];
+  } catch (e) { return list; }
+  const have = new Set(list.map(k => k.key));
+  const missing = readKeysBackup().filter(k => k && k.key && !have.has(k.key));
+  if (missing.length) {
+    try {
+      await apiGet('/api/keys/sync', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ keys: missing }),
+      });
+      const d = await apiGet('/api/keys');
+      list = d.keys || list;
+    } catch (e) {}
+  }
+  if (list.length) writeKeysBackup(list); // пустой ответ не затирает бэкап
+  return list;
+}
+
 async function renderKeys() {
   const box = $('apiKeyList');
   try {
-    const d = await apiGet('/api/keys');
-    if (!d.keys || !d.keys.length) {
+    const all = await loadKeyList();
+    const list = all.filter(k => !k.disabled); // отозванные не показываем
+    if (!list.length) {
       box.innerHTML = '<div class="key-empty">Ключей пока нет — создайте первый</div>';
       return;
     }
     box.innerHTML = '';
-    for (const k of d.keys) {
+    for (const k of list) {
       const row = document.createElement('div');
       row.className = 'key-row';
       const created = new Date(k.createdAt).toLocaleDateString('ru-RU');
@@ -479,7 +513,8 @@ async function init() {
       api.key = d.webKey;
       localStorage.setItem('vg_key', d.webKey);
     }
-    $('targetBadge').textContent = 'API: ' + (d.target || '—');
+    $('targetBadge').textContent = 'API: ' + (d.target || '—')
+      + (d.stableKeys === false ? ' · ⚠ ключи не сохранятся без WEB_KEY' : '');
   } catch (e) {}
 
   document.querySelectorAll('.engine-btn').forEach(b => {
@@ -519,6 +554,7 @@ async function init() {
   updateCounter();
   initKeys();
   fetchJobs();
+  loadKeyList().catch(() => {}); // восстановление ключей после редеплоя — фоном
   startPolling();
 }
 
