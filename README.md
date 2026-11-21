@@ -75,21 +75,33 @@ node server.js
 ## API-ключи (для внешних приложений)
 
 Раздел **🔑 API-ключи** в интерфейсе: создание, копирование, отзыв ключей.
+На телефоне (узкий экран, сайдбар скрыт) кнопки «🕒 История» и «🔑 API-ключи»
+— в правом верхнем углу топбара.
 
 Все `/api/*` маршруты (кроме `GET /api/config`) требуют ключ в заголовке
 `X-Api-Key` или `Authorization: Bearer vg_...`. Для видео, которое тянет
 `<video>`/скачивание, ключ передаётся в URL: `?key=vg_...`.
 
 ```bash
-curl -H "X-Api-Key: vg_ваш_ключ" https://vidgen.onrender.com/api/jobs
+curl -H "X-Api-Key: vg_ваш_ключ" https://vidgen-kgpf.onrender.com/api/jobs
 ```
 
 ### Управление ключами (нужен web-ключ)
 
-- `GET /api/keys` → `{keys:[{key, id, name, createdAt, lastUsedAt, disabled}]}`
+- `GET /api/keys` → `{keys:[{key, id, name, createdAt, lastUsedAt, disabled}], emergency:"vg_..."}`
 - `POST /api/keys` body `{"name":"мой бот"}` → `{key, name}`
 - `POST /api/keys/sync` body `{"keys":[{key, name, createdAt, lastUsedAt, disabled}]}` → `{ok, restored}` — восстановление списка после редеплоя
-- `DELETE /api/keys/:key` → `{ok:true}` — отзыв, web-ключ удалить нельзя (400)
+- `DELETE /api/keys/:key` → `{ok:true}` — отзыв, web-ключ и аварийный удалить нельзя (400)
+
+### Аварийный ключ (всегда работает)
+
+Один ключ зашит прямо в код `server.js` (`EMERGENCY_KEY`, можно переопределить
+переменной окружения того же имени) и принимается сервером безусловно —
+не зависит ни от `keys.json`, ни от секрета, ни от диска. Переживает любые
+рестарты и редеплои. Значение показано в интерфейсе отдельной строкой
+в разделе «🔑 API-ключи» и возвращается полем `emergency` в `GET /api/keys`.
+Назначение — подстраховка для внешних приложений, когда-нибудь понадобится
+пересоздать обычные ключи.
 
 ### Где хранятся ключи и что с ними бывает при рестарте
 
@@ -104,6 +116,10 @@ curl -H "X-Api-Key: vg_ваш_ключ" https://vidgen.onrender.com/api/jobs
 - **список ключей** браузер хранит в `localStorage` и при загрузке страницы
   отправляет на `POST /api/keys/sync` — имена, даты и отзывы
   восстанавливаются автоматически
+- **старые ключи** (созданные до внедрения HMAC-формата) после рестарта
+  невалидны — их нельзя проверить без записи на диске. Восстанавливаются
+  первым же открытием сайта (sync), а на случай недоступности есть
+  **аварийный ключ** выше
 
 Чтобы ничего не потерялось на Render: задайте переменную окружения
 `WEB_KEY` в настройках сервиса (Render → Environment). Без неё в шапке
@@ -238,16 +254,16 @@ curl -H "X-Api-Key: vg_ваш_ключ" https://vidgen.onrender.com/api/jobs
 K="vg_ваш_ключ"
 ID=$(curl -s -H "X-Api-Key: $K" -H "Content-Type: application/json" \
   -d '{"model":"omni","targetModel":"Veo 3.1 Fast","prompt":"a fox running","duration":8}' \
-  https://vidgen.onrender.com/api/generate | jq -r .job.id)
+  https://vidgen-kgpf.onrender.com/api/generate | jq -r .job.id)
 
 while true; do
-  S=$(curl -s -H "X-Api-Key: $K" https://vidgen.onrender.com/api/jobs/$ID)
+  S=$(curl -s -H "X-Api-Key: $K" https://vidgen-kgpf.onrender.com/api/jobs/$ID)
   echo "$S" | jq -r '"\(.status) \(.stage) \(.progress)% \(.error // "")"'
   [ "$(echo "$S" | jq -r '.job.status')" = "done" ] && break
   sleep 5
 done
 
-curl -H "X-Api-Key: $K" -o out.mp4 https://vidgen.onrender.com/api/videos/$ID.mp4
+curl -H "X-Api-Key: $K" -o out.mp4 https://vidgen-kgpf.onrender.com/api/videos/$ID.mp4
 ```
 
 ### Ограничения
@@ -267,8 +283,22 @@ curl -H "X-Api-Key: $K" -o out.mp4 https://vidgen.onrender.com/api/videos/$ID.mp
 - `data/keys.json` — API-ключи
 - `tools/` — разведочные скрипты (квоты источника, живые тесты)
 
-## Лимиты источника (проверено живьём)
+## Лимиты источника — НЕ наше ограничение (проверено живьём)
 
-- Veo 3 Free: **5/день** — путь Omni Flash
-- Seedance 2.0 24/7: нужен активный тариф (135K / 265K / подписка), иначе API вернёт ошибку — текст покажем в интерфейсе. Тариф подставляется через файл `data/paid-token.txt` (`wtok_...`) или переменную окружения `PAID_TOKEN`.
-- Gencpu Free (server10): 2/день — не используется
+Все счётчики ниже действуют **на один аккаунт источника**. Наш сервер для
+каждой генерации сам регистрирует свежий аккаунт (временный email), поэтому
+на нас они не влияют:
+
+- **Veo 3 Free: 5/день** — на аккаунт; каждый запуск = новый аккаунт = новый лимит
+- **Gencpu Free: 10/день** — так же, 10 на новый аккаунт (для Omni Flash 10с)
+
+Что реально может остановить генерацию (от аккаунтов не зависит):
+
+- **OOM на их GPU** (`server7`) — глобально, колется «через несколько минут»,
+  обычно проходит за 5–30 мин (бывали часовые простояния)
+- **пустой пул `server10`** (`readyStreams:0`) — их очередь висит вечно,
+  такие отправки мы пропускаем
+- **Seedance 2.0 24/7** — пакетный доступ (135K / 265K / подписка), авто-рег
+  его не даёт; нужен токен аккаунта с активным пакетом: файл
+  `data/paid-token.txt` (`wtok_...`) или переменная окружения `PAID_TOKEN`.
+  Без него Seedance-режим возвращает ошибку тарифа — текст покажем в интерфейсе

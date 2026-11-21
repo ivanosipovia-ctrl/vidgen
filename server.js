@@ -103,6 +103,11 @@ if (!keys[webKey] || keys[webKey].id !== WEB_KEY_ID) {
   saveKeys();
 }
 const WEB_KEY = webKey;
+// Аварийный ключ — зашит в сам код: принимается сервером ВСЕГДА, переживает
+// любые рестарты/редеплои и утрату keys.json (не зависит ни от секрета, ни от
+// диска). Для генераций; управление ключами — только через web-ключ.
+// Можно переопределить переменной окружения EMERGENCY_KEY.
+const EMERGENCY_KEY = String(process.env.EMERGENCY_KEY || 'vg_e4c1a7f9d20b6835ac91e0d7').trim();
 // локально диск постоянный — ключи и так стабильны; на эфемерном диске
 // без переменной окружения они будут меняться при каждом рестарте
 const STABLE_KEYS = Boolean(KEY_SECRET_ENV || WEB_KEY_ENV) || !ON_RENDER;
@@ -121,6 +126,9 @@ function keyFrom(req, url) {
 function authKey(req, url) {
   const k = keyFrom(req, url);
   if (!k) return null;
+  if (k === EMERGENCY_KEY) {
+    return { key: k, id: 'emergency', name: 'аварийный' };
+  }
   if (k === WEB_KEY) {
     if (keys[k]) keys[k].lastUsedAt = Date.now();
     return { key: k, id: WEB_KEY_ID, name: 'web' };
@@ -315,7 +323,9 @@ function buildBatchPayload(opts) {
         useServer7: true,
         engine: 'server7',
         cookieSource: 'server7',
-        sv7Mode: 'gencpu_video',
+        // их фронт getActiveSv7ModeKey(): для Seedance 2.5 Lite режим 'seedance_25_lite'
+        // (свой пул); 'gencpu_video' уводит в пул Gencpu AI, который в OOM
+        sv7Mode: 'seedance_25_lite',
       });
       const sv10 = Object.assign({}, base10, {
         model: 'Gencpu 1.1',
@@ -695,7 +705,7 @@ const server = http.createServer(async (req, res) => {
           createdAt: v.createdAt, lastUsedAt: v.lastUsedAt || null,
           disabled: Boolean(v.disabled),
         }));
-      return json(res, 200, { keys: list });
+      return json(res, 200, { keys: list, emergency: EMERGENCY_KEY });
     }
 
     if (p === '/api/keys' && req.method === 'POST') {
@@ -752,6 +762,9 @@ const server = http.createServer(async (req, res) => {
       const who = authKey(req, url);
       if (!isWeb(who)) return json(res, 403, { error: 'нужен web-ключ' });
       const targetKey = keyDel[1];
+      if (targetKey === EMERGENCY_KEY) {
+        return json(res, 400, { error: 'аварийный ключ удалить нельзя' });
+      }
       if (targetKey === WEB_KEY || (keys[targetKey] && keys[targetKey].id === WEB_KEY_ID)) {
         return json(res, 400, { error: 'web-ключ удалить нельзя' });
       }
